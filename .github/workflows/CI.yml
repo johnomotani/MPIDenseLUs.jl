@@ -2,8 +2,6 @@ name: CI
 on:
   push:
     branches:
-      - main
-    tags: ['*']
   pull_request:
   workflow_dispatch:
 concurrency:
@@ -24,7 +22,6 @@ jobs:
       matrix:
         version:
           - '1.12'
-          - 'pre'
         os:
           - ubuntu-latest
         arch:
