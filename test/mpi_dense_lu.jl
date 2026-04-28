@@ -148,6 +148,11 @@ end
 function mpi_dense_lu_tests()
     nproc = MPI.Comm_size(MPI.COMM_WORLD)
     for n_shared ∈ [prod(x) for x ∈ unique(combinations(factor(Vector, nproc)))], distributed_block_rows ∈ (nothing, 1)
+        if n_shared == nproc && distributed_block_rows !== nothing
+            # distributed_block_rows does not have any effect when only using
+            # shared-memory parallelism, so skip redundant tests.
+            continue
+        end
         mpi_dense_lu_test(n_shared, distributed_block_rows)
     end
 end
