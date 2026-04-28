@@ -1,5 +1,5 @@
-using ColumnPivotLUs
-using ColumnPivotLUs: apply_row_swaps!
+using MPISharedMemLUs
+using MPISharedMemLUs: apply_row_swaps!
 
 # Implement efficient parallel LU factorization, based on ideas in:
 # L. Grigori, J. Demmel, and H. Xiang, "CALU: a communication optimal LU factorization algorithm", SIAM Journal on Matrix Analysis and Applications, 32 (2011), pp. 1317-1350.
@@ -69,7 +69,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
 
     row_permutation = allocate_shared_int(m)
 
-    if tile_size ≤ ColumnPivotLUs.block_size && distributed_comm_size > 1
+    if tile_size ≤ MPISharedMemLUs.block_size && distributed_comm_size > 1
         # No point using RowPivotLUMPI, as it will just pass through to `LAPACK.getrf!()`
         # for this `tile_size`. Instead, store an `ipiv` vector to use when calling
         # `LAPACK.getrf!()` directly.
@@ -634,8 +634,7 @@ function distributed_memory_tree_pivot_generation!(
                 # Apply row swaps to reduction buffer so that the pivot rows are moved
                 # to the first `this_tile_size` rows.
                 # Could parallelise this with shared-memory...
-                ColumnPivotLUs.apply_row_swaps!(reduction_buffer, ipiv,
-                                                this_tile_size, this_tile_size)
+                apply_row_swaps!(reduction_buffer, ipiv, this_tile_size, this_tile_size)
             end
         end
 
