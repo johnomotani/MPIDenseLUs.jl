@@ -155,7 +155,7 @@ function mpi_dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
             setup_lu(m, n, tile_size, shared_comm, shared_comm_rank, shared_comm_size,
                      distributed_comm_rank[], distributed_comm_size[], datatype,
                      allocate_shared_float, allocate_shared_int, synchronize_shared,
-                     group_K, group_L, timer)
+                     group_K, group_L, timer, check_lu)
 
         ldiv_variables =
             setup_ldiv(m, datatype, tile_size, comm, shared_comm, shared_comm_size,
@@ -167,8 +167,8 @@ function mpi_dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
                            shared_comm_rank, shared_comm_size, distributed_comm,
                            distributed_comm_rank=distributed_comm_rank[],
                            distributed_comm_size=distributed_comm_size[], is_root,
-                           synchronize_shared, check_lu, group_K, group_L,
-                           lu_variables..., ldiv_variables..., timer)
+                           synchronize_shared, group_K, group_L, lu_variables...,
+                           ldiv_variables..., timer)
     end
 
     if !skip_factorization

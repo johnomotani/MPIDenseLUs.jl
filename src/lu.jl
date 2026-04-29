@@ -65,7 +65,8 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
                   shared_comm_rank::Int64, shared_comm_size::Int64,
                   distributed_comm_rank::Int64, distributed_comm_size::Int64,
                   datatype::Type, allocate_shared_float::Ff, allocate_shared_int::Fi,
-                  synchronize_shared, group_K::Int64, group_L::Int64, timer) where {Ff,Fi}
+                  synchronize_shared, group_K::Int64, group_L::Int64, timer,
+                  check_lu::Bool) where {Ff,Fi}
 
     row_permutation = allocate_shared_int(m)
 
@@ -78,7 +79,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
         ipiv = allocate_shared_int(m)
         factorization_shared_lu = get_row_pivot_lu(ipiv, shared_comm;
                                                    synchronize=synchronize_shared,
-                                                   timer=timer)
+                                                   timer=timer, check=check_lu)
     end
 
     group_l, group_k = divrem(distributed_comm_rank, group_K) .+ 1
@@ -194,7 +195,8 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
             factorization_pivoting_reduction_indices_local, factorization_source_rows,
             factorization_locally_owned_swap_rows, factorization_top_panel_pivots,
             factorization_non_local_pivots, factorization_top_panel_rows_to_send,
-            factorization_row_swap_buffers, factorization_shared_lu, comm_requests)
+            factorization_row_swap_buffers, factorization_shared_lu, comm_requests,
+            check_lu)
 end
 
 function lu!(A_lu::MPIDenseLU{T}, A::AbstractMatrix{T}) where T
