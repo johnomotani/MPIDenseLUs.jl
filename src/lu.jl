@@ -197,7 +197,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
             factorization_row_swap_buffers, factorization_shared_lu, comm_requests)
 end
 
-function lu!(A_lu::MPIDenseLU{T}, A::AbstractMatrix{T}) where T
+function lu!(A_lu::MPIDenseLU{T}, A::Union{AbstractMatrix{T},Nothing}) where T
     @dlu_timeit A_lu.timer "lu!" begin
         shared_comm_rank = A_lu.shared_comm_rank
 

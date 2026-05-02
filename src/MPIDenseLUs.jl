@@ -88,26 +88,42 @@ macro dlu_timeit(timer, name, expr)
     end
 end
 
-function mpi_dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
+function mpi_dense_lu(A::Union{AbstractMatrix,Nothing}, tile_size::Int64, comm::MPI.Comm,
                       shared_comm::MPI.Comm, distributed_comm::MPI.Comm,
                       allocate_shared_float::Function, allocate_shared_int::Function;
                       synchronize_shared=nothing, distributed_block_rows=nothing,
                       skip_factorization=false, check_lu=true,
                       timer::Union{TimerOutput,Nothing}=nothing)
     @dlu_timeit timer "setup" begin
-        datatype = eltype(A)
-
         if synchronize_shared === nothing
             synchronize_shared = ()->MPI.Barrier(shared_comm)
         end
 
-        m, n = size(A)
+        comm_rank = MPI.Comm_rank(comm)
+        comm_size = MPI.Comm_size(comm)
+
+        if comm_rank == 0
+            datatype = eltype(A)
+            MPI.bcast(datatype, comm; root=0)
+            m, n = size(A)
+            mref = Ref(m)
+            nref = Ref(n)
+            req1 = temp_Ibcast!(mref, comm; root=0)
+            req2 = temp_Ibcast!(nref, comm; root=0)
+            MPI.Waitall([req1, req2])
+        else
+            datatype = MPI.bcast(nothing, comm; root=0)
+            mref = Ref(0)
+            nref = Ref(0)
+            req1 = temp_Ibcast!(mref, comm; root=0)
+            req2 = temp_Ibcast!(nref, comm; root=0)
+            MPI.Waitall([req1, req2])
+            m = mref[]
+            n = nref[]
+        end
         if m != n
             error("Non-square matrices not supported in MPIDenseLU. Got ($m,$n).")
         end
-
-        comm_rank = MPI.Comm_rank(comm)
-        comm_size = MPI.Comm_size(comm)
 
         shared_comm_rank = MPI.Comm_rank(shared_comm)
         shared_comm_size = MPI.Comm_size(shared_comm)

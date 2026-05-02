@@ -29,18 +29,22 @@ function mpi_dense_lu_test(n_shared, distributed_block_rows)
             end
 
             A = allocate_array_float(m, m)
-            Afactors = allocate_array_float(m, m)
             b = allocate_array_float(m)
             x = allocate_array_float(m)
 
-            if shared_rank == 0 && distributed_rank == 0
-                A .= rand(rng, m, m)
-                # Ensure A is non-singular.
-                while abs(det(A)) < 1.0e-4
+            if distributed_rank == 0
+                Afactors = allocate_array_float(m, m)
+                if shared_rank == 0
                     A .= rand(rng, m, m)
+                    # Ensure A is non-singular.
+                    while abs(det(A)) < 1.0e-4
+                        A .= rand(rng, m, m)
+                    end
+                    Afactors .= A
+                    b .= rand(rng, m)
                 end
-                Afactors .= A
-                b .= rand(rng, m)
+            else
+                Afactors = nothing
             end
             if shared_rank == 0
                 MPI.Bcast!(A, distributed_comm; root=0)
