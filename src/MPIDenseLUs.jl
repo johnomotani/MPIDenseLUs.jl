@@ -88,11 +88,49 @@ macro dlu_timeit(timer, name, expr)
     end
 end
 
+"""
+    mpi_dense_lu(A::Union{AbstractMatrix,Nothing}, tile_size::Int64, comm::MPI.Comm,
+                 shared_comm::MPI.Comm, distributed_comm::MPI.Comm,
+                 allocate_shared_float::Function, allocate_shared_int::Function;
+                 synchronize_shared::Union{Function,Nothing}=nothing,
+                 distributed_block_rows::Union{Integer,Nothing}=nothing,
+                 skip_factorization::Bool=false, check_lu::Bool=true,
+                 timer::Union{TimerOutput,Nothing}=nothing)
+
+The matrix `A` to be factorized must be passed only on the 0'th shared-memory block.
+Factorization can be skipped by passing `skip_factorization=false`, but a matrix of the
+correct size and type must be passed anyway.
+
+`tile_size` is the tile size used for both factorization and matrix-solve.
+
+MPI communicators are required: `comm` contains all the processes participating;
+`shared_comm` contains the processes in each shared-memory block; `distributed_comm` is
+required only on rank-0 of each shared-memory block and contains the rank-0 process of
+each shared-memory block.
+
+`allocate_shared_float` and `allocate_shared_int` are functions that allocate a
+shared-memory array (shared by the processes in `shared_comm`) with float or integer type.
+
+`synchronize_shared` can be passed a custom function to synchronize the processes in
+`shared_comm`. By default `MPI.Barrier(shared_comm)` is used.
+
+`distributed_block_rows` controls the layout of shared-memory blocks used for LU
+factorization. If passed, it must be a factor of the size of `distributed_comm`, and the
+blocks are laid out in `distributed_block_rows` rows and `MPI.Comm_size(distributed_comm)
+÷ distributed_block_rows` columns. By default the number of rows is set to be as close to
+`sqrt(MPI.Comm_size(distributed_comm))` as possible, with more rows than columns if the
+numbers cannot be equal.
+
+`check_lu=false` can be passed to skip checks that the matrix entries are finite.
+
+`timer` can be passed a `TimerOutput` object to record timings.
+"""
 function mpi_dense_lu(A::Union{AbstractMatrix,Nothing}, tile_size::Int64, comm::MPI.Comm,
                       shared_comm::MPI.Comm, distributed_comm::MPI.Comm,
                       allocate_shared_float::Function, allocate_shared_int::Function;
-                      synchronize_shared=nothing, distributed_block_rows=nothing,
-                      skip_factorization=false, check_lu=true,
+                      synchronize_shared::Union{Function,Nothing}=nothing,
+                      distributed_block_rows::Union{Integer,Nothing}=nothing,
+                      skip_factorization::Bool=false, check_lu::Bool=true,
                       timer::Union{TimerOutput,Nothing}=nothing)
     @dlu_timeit timer "setup" begin
         if synchronize_shared === nothing
