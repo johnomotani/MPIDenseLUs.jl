@@ -1,6 +1,6 @@
 name = "MPIDenseLUs"
 uuid = "e8a62dcf-60e4-418b-90b5-fa9f605e4ca5"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["John Omotani <john.omotani@ukaea.uk> and contributors"]
 
 [deps]
@@ -12,11 +12,8 @@ Primes = "27ebfcd6-29c5-5fa9-bf4b-fb8fc14df3ae"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 TimerOutputs = "a759f4b9-e2f1-59dc-863e-4aeb61b1ea8f"
 
-[sources]
-MPISharedMemLUs = {url = "https://github.com/johnomotani/MPISharedMemLUs.jl"}
-
 [compat]
-MPISharedMemLUs = "0.1.0"
+MPISharedMemLUs = "1.0.0"
 Combinatorics = "1.1.0"
 LinearAlgebra = "1.11.0"
 MPI = "0.20.23"

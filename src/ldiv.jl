@@ -701,7 +701,7 @@ function ldiv!(A_lu::MPIDenseLU{T}, b::AbstractVector{T}) where T
     return ldiv!(b, A_lu, b)
 end
 
-function ldiv!(x::AbstractVector{T}, A_lu::MPIDenseLU{T}, b::AbstractVector{T}) where T
+function ldiv!(x::AbstractVector{T}, A_lu::MPIDenseLU{T}, b::Union{AbstractVector{T},Nothing}) where T
     @dlu_timeit A_lu.timer "ldiv!" begin
         is_root = A_lu.is_root
         row_permutation = A_lu.row_permutation
