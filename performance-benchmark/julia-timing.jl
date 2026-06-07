@@ -3,7 +3,6 @@ using HDF5
 using LinearAlgebra
 using MPI
 using TimerOutputs
-using MPISchurComplements
 using MPIDenseLUs
 using TeeStreams
 

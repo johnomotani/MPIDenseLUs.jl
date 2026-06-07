@@ -2,7 +2,6 @@ using Dates
 using HDF5
 using LinearAlgebra
 using MPI
-using MPISchurComplements
 using MPIDenseLUs
 
 include("../test/utils.jl")
