@@ -202,7 +202,7 @@ function lu!(A_lu::MPIDenseLU{T}, A::Union{AbstractMatrix{T},Nothing}) where T
         shared_comm_rank = A_lu.shared_comm_rank
 
         if A_lu.distributed_comm_size == 1
-            # No distributed-memory MPI, more efficient to use RowPivotLUMPI directly,
+            # No distributed-memory MPI, more efficient to use MPISharedMemLUs directly,
             # which uses only shared-memory MPI parallelism.
             shared_lu = A_lu.factorization_shared_lu
             row_permutation = A_lu.row_permutation

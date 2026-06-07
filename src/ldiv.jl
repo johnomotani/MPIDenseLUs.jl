@@ -731,7 +731,7 @@ function ldiv!(x::AbstractVector{T}, A_lu::MPIDenseLU{T}, b::Union{AbstractVecto
     return x
 end
 
-function L_solve!(y, A_lu::MPIDenseLU{T}, b) where T
+function L_solve!(y::AbstractVector, A_lu::MPIDenseLU{T}, b::AbstractVector) where T
     @dlu_timeit A_lu.timer "L_solve!" begin
         m = A_lu.m
         n_tiles = A_lu.n_tiles
@@ -859,7 +859,7 @@ function L_solve!(y, A_lu::MPIDenseLU{T}, b) where T
     return nothing
 end
 
-function U_solve!(x, A_lu::MPIDenseLU{T}, y) where T
+function U_solve!(x::AbstractVector, A_lu::MPIDenseLU{T}, y::AbstractVector) where T
     @dlu_timeit A_lu.timer "U_solve!" begin
         m = A_lu.m
         n_tiles = A_lu.n_tiles
@@ -968,6 +968,348 @@ function U_solve!(x, A_lu::MPIDenseLU{T}, y) where T
                             itile_rev = n_tiles - t + 1
                             U_send_requests[t] =
                                 temp_Ireduce!(@view(U_rhs_update_buffer[(itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)]),
+                                              +, distributed_comm; root=0)
+                        end
+                    end
+                    for tile ∈ @view new_column_triggers[:,step]
+                        if tile == 0
+                            # No more to do
+                            break
+                        end
+                        MPI.Wait(U_receive_requests[tile])
+                    end
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        end
+    end
+
+    return nothing
+end
+
+"""
+    ldiv!(A_lu::MPIDenseLU{T}, b::AbstractMatrix{T}, buffer1::AbstractMatrix{T},
+          buffer2::AbstractMatrix{T}) where T
+
+Matrix-matrix solve by MPIDenseLU requires three buffer arrays. `buffer1` and `buffer2`
+are the same size as the transpose of `b`. `buffer3` is the size of the transpose of `b`.
+All are shared-memory arrays if shared memory parallelism is being used.
+"""
+function ldiv!(A_lu::MPIDenseLU{T}, b::AbstractMatrix{T}, buffer1::AbstractMatrix{T},
+               buffer2::AbstractMatrix{T}, buffer3::AbstractMatrix{T}) where T
+    return ldiv!(b, A_lu, b, buffer1, buffer2)
+end
+
+"""
+    ldiv!(x::AbstractMatrix{T}, A_lu::MPIDenseLU{T}, b::AbstractMatrix{T},
+          buffer1::AbstractMatrix{T}, buffer2::Union{AbstractMatrix{T},Nothing}) where T
+
+Matrix-matrix solve by MPIDenseLU requires three buffer arrays. `buffer1` and `buffer2`
+are the same size as the `x` and `b`. `buffer3` is the size of the transposes of `x` and
+`b`.  All are shared-memory arrays if shared memory parallelism is being used. `buffer2`
+can be the same matrix as `b`, if `b` is a different array than `x` and if it is not
+necessary to leave `b` unmodified.
+"""
+function ldiv!(x::AbstractMatrix{T}, A_lu::MPIDenseLU{T}, b::AbstractMatrix{T},
+               buffer1::AbstractMatrix{T}, buffer2::AbstractMatrix{T},
+               buffer3::AbstractMatrix{T}) where T
+    @dlu_timeit A_lu.timer "ldiv!" begin
+        is_root = A_lu.is_root
+        row_permutation = A_lu.row_permutation
+        shared_comm_rank = A_lu.shared_comm_rank
+        shared_comm_size = A_lu.shared_comm_size
+        distributed_comm_rank = A_lu.distributed_comm_rank
+        synchronize_shared = A_lu.synchronize_shared
+
+        # Parallelise some operations over columns where possible.
+        nrow, ncol = size(b)
+        cols_per_proc = (ncol + shared_comm_size - 1) ÷ shared_comm_size
+        rhs_col_range = shared_comm_rank*cols_per_proc+1:min((shared_comm_rank+1)*cols_per_proc,ncol)
+        rows_per_proc = (nrow + shared_comm_size - 1) ÷ shared_comm_size
+        rhs_row_range = shared_comm_rank*rows_per_proc+1:min((shared_comm_rank+1)*rows_per_proc,nrow)
+
+        if distributed_comm_rank == 0
+            # Permute the RHS, storing in buffer1. This accounts for 'row permutations' that were
+            # generated/used for 'pivoting' when the L and U factors were computed.
+            for j ∈ rhs_col_range, (i1, i2) ∈ enumerate(row_permutation)
+                @views buffer1[i1,j] = b[i2,j]
+            end
+        end
+
+        L_solve!(buffer2, A_lu, buffer1, buffer3, rhs_row_range)
+        # In this version, need to make sure the MPI communications from L_solve!()
+        # complete before U_solve!() starts, because we re-use buffer3 for the
+        # communications.
+        MPI.Waitall(A_lu.L_send_requests)
+        MPI.Waitall(A_lu.L_receive_requests)
+        synchronize_shared()
+
+        U_solve!(x, A_lu, buffer2, buffer3, rhs_row_range, buffer1)
+        MPI.Waitall(A_lu.U_send_requests)
+        MPI.Waitall(A_lu.U_receive_requests)
+    end
+
+    return x
+end
+
+function L_solve!(y::AbstractMatrix, A_lu::MPIDenseLU{T}, b::AbstractMatrix,
+                  L_rhs_update_buffer::AbstractMatrix, rhs_row_range) where T
+    @dlu_timeit A_lu.timer "L_solve!" begin
+        m = A_lu.m
+        n_tiles = A_lu.n_tiles
+        tile_size = A_lu.tile_size
+        my_L_tiles = A_lu.my_L_tiles
+        my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
+        my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
+        diagonal_indices = A_lu.diagonal_indices
+        synchronize_shared = A_lu.synchronize_shared
+        L_receive_requests = A_lu.L_receive_requests
+        L_send_requests = A_lu.L_send_requests
+        new_column_triggers = A_lu.new_column_triggers
+        step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
+        shared_comm_rank = A_lu.shared_comm_rank
+        distributed_comm = A_lu.distributed_comm
+        distributed_comm_size = A_lu.distributed_comm_size
+
+        L_rhs_update_buffer[:,rhs_row_range] .= 0.0
+        synchronize_shared()
+
+        if A_lu.is_root
+            for step ∈ 1:length(my_L_tile_row_ranges)
+                diagonal_tile = diagonal_indices[step]
+                row_range = my_L_tile_row_ranges[step]
+                col_range = my_L_tile_col_ranges[step]
+                if diagonal_tile > 0
+                    # Wait to ensure that contributions from all other blocks have been added
+                    # to `b`.
+                    MPI.Wait(L_receive_requests[diagonal_tile])
+                    # Root process always wrote to b[tile_range] on the previous step, so no
+                    # need to synchronize before this calculation.
+                    # Still need to add this block's contributions to `b`.
+                    @views L_rhs_update_buffer[:,col_range] .+= L_rhs_update_buffer[:,1:length(col_range)]
+                    @views y[col_range,:] .= b[col_range,:] .+ transpose(L_rhs_update_buffer[:,col_range])
+                    # Need the [1:length(row_range),1:length(col_range)] selection, even
+                    # though for most tiles this is just the full range, because the last row
+                    # and column may have a different size
+                    @views trsm!('L', 'L', 'N', 'U',
+                                 one(T),
+                                 my_L_tiles[1:length(row_range),1:length(col_range),step],
+                                 y[col_range,:])
+                    if diagonal_tile < n_tiles && distributed_comm_size > 1
+                        L_send_requests[diagonal_tile] = temp_Ibcast!(@view(y[col_range,:]),
+                                                                      distributed_comm; root=0)
+                        # Start MPI.Ireduce!() ready for the next diagonal tile. MPI
+                        # non-blocking collective operations have to be called in the same
+                        # order on all ranks
+                        # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm),
+                        # so we cannot start this operation earlier.
+                        t = diagonal_tile+1
+                        buffer_size = min(t*tile_size,m)-(t-1)*tile_size
+                        this_buffer = @view L_rhs_update_buffer[:,1:buffer_size]
+                        this_buffer .= 0.0
+                        L_receive_requests[t] =
+                            temp_Ireduce!(this_buffer, +, distributed_comm; root=0)
+                    end
+                else
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    @views gemm!('T', 'T', -one(T), y[col_range,:],
+                                 my_L_tiles[1:length(row_range),:,step], one(T),
+                                 L_rhs_update_buffer[:,row_range])
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        else
+            for step ∈ 1:length(my_L_tile_row_ranges)
+                row_range = my_L_tile_row_ranges[step]
+                col_range = my_L_tile_col_ranges[step]
+                if !isempty(row_range)
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    @views gemm!('T', 'T', -one(T), y[col_range,:],
+                                 my_L_tiles[1:length(row_range),:,step], one(T),
+                                 L_rhs_update_buffer[:,row_range])
+                end
+                if shared_comm_rank == 0
+                    # `diagonal_indices[step]` is non-zero if the root process is handling a
+                    # diagonal tile on this step.
+                    maybe_diagonal_tile = diagonal_indices[step]
+                    if maybe_diagonal_tile > 0
+                        # Data from the maybe_diagonal_tile is available, so start the
+                        # MPI.Ibcast!(). Also the maybe_diagonal_tile+1 row is guaranteed to be
+                        # completed, as only the root process will handle any tiles from that row
+                        # from this step on, so start the MPI.Ireduce!(). MPI non-blocking
+                        # collective operations have to be called in the same order on all ranks
+                        # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
+                        # have to match the order that these operations are started on the root
+                        # process.
+                        if maybe_diagonal_tile < n_tiles && distributed_comm_size > 1
+                            L_receive_requests[maybe_diagonal_tile] =
+                                temp_Ibcast!(@view(y[(maybe_diagonal_tile-1)*tile_size+1:min(maybe_diagonal_tile*tile_size, m),:]),
+                                             distributed_comm; root=0)
+                            # We have sorted the tiles so that the shared_comm_rank=0 process
+                            # always handles the lowest row in the block, so if
+                            # `t` was handled on this step on this block, it was definitely
+                            # handled on this rank, so we do not need to synchronize.
+                            t = maybe_diagonal_tile + 1
+                            L_send_requests[t] =
+                                temp_Ireduce!(@view(L_rhs_update_buffer[:,(t-1)*tile_size+1:min(t*tile_size,m)]),
+                                              +, distributed_comm; root=0)
+                        end
+                    end
+                    # Ensure data required for the next tiles processed on the block has arrived.
+                    for tile ∈ @view new_column_triggers[:,step]
+                        if tile == 0
+                            # No more to do
+                            break
+                        end
+                        MPI.Wait(L_receive_requests[tile])
+                    end
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        end
+    end
+
+    return nothing
+end
+
+function U_solve!(x::AbstractMatrix, A_lu::MPIDenseLU{T}, y::AbstractMatrix,
+                  U_rhs_update_buffer::AbstractMatrix, rhs_row_range, buffer) where T
+    @dlu_timeit A_lu.timer "U_solve!" begin
+        m = A_lu.m
+        n_tiles = A_lu.n_tiles
+        tile_size = A_lu.tile_size
+        my_U_tiles = A_lu.my_U_tiles
+        my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
+        my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
+        diagonal_indices = A_lu.diagonal_indices
+        synchronize_shared = A_lu.synchronize_shared
+        U_receive_requests = A_lu.U_receive_requests
+        U_send_requests = A_lu.U_send_requests
+        new_column_triggers = A_lu.new_column_triggers
+        step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
+        shared_comm_rank = A_lu.shared_comm_rank
+        distributed_comm = A_lu.distributed_comm
+        distributed_comm_size = A_lu.distributed_comm_size
+
+        U_rhs_update_buffer[:,rhs_row_range] .= 0.0
+        synchronize_shared()
+
+        if A_lu.is_root
+            x_ncol = size(x, 2)
+            reduction_buffer = reshape(@view(buffer[1:x_ncol*tile_size]), x_ncol, tile_size)
+            reduction_buffer .= 0.0
+
+            for step ∈ 1:length(my_U_tile_row_ranges)
+                diagonal_tile = diagonal_indices[step]
+                row_range = my_U_tile_row_ranges[step]
+                col_range = my_U_tile_col_ranges[step]
+                if diagonal_tile > 0
+                    # Wait to ensure that contributions from all other blocks have been added
+                    # to `y`.
+                    MPI.Wait(U_receive_requests[diagonal_tile])
+                    # Root process always wrote to b[tile_range] on the previous step, so no
+                    # need to synchronize before this calculation.
+                    # Still need to add this block's contributions to `y`.
+                    # We exploit the extra buffer (buffer1) available in `ldiv!()` that is
+                    # not otherwise used for U_solve!() and can be reshaped into
+                    # reduction_buffer as the receive buffer for distributed MPI
+                    # communications. This is needed because the first step of U_solve!()
+                    # may act on a number of entries that is less that tile_size, so using
+                    # the last tile_size entries of U_rhs_update_buffer (in a similar way
+                    # to using the first tile_size entries of L_rhs_update_buffer in
+                    # L_solve!()) would result in the communication for the
+                    # second-processed diagonal tile overlapping the contributions to
+                    # U_rhs_update_buffer calculated on the root process for that tile.
+                    @views U_rhs_update_buffer[:,col_range] .+= reduction_buffer[:,1:length(col_range)]
+                    @views x[col_range,:] .= y[col_range,:] .+ transpose(U_rhs_update_buffer[:,col_range])
+                    # Need the [1:length(row_range),1:length(col_range)] selection, even
+                    # though for most tiles this is just the full range, because the last row
+                    # and column may have a different size
+                    @views trsm!('L', 'U', 'N', 'N',
+                                 one(T),
+                                 my_U_tiles[1:length(row_range),1:length(col_range),step],
+                                 x[col_range,:])
+                    U_send_requests[diagonal_tile] = temp_Ibcast!(@view(x[col_range,:]),
+                                                                  distributed_comm; root=0)
+                    if diagonal_tile < n_tiles && distributed_comm_size > 1
+                        # Start MPI.Ireduce!() ready for the next diagonal tile. MPI
+                        # non-blocking collective operations have to be called in the same
+                        # order on all ranks
+                        # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm),
+                        # so we cannot start this operation earlier.
+                        t = diagonal_tile+1
+                        itile_rev = n_tiles - t + 1
+                        buffer_size = min(itile_rev*tile_size,m) - (itile_rev-1)*tile_size
+                        this_buffer = @view reduction_buffer[:,1:buffer_size]
+                        this_buffer .= 0.0
+                        U_receive_requests[t] =
+                            temp_Ireduce!(this_buffer, +, distributed_comm; root=0)
+                    end
+                else
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    @views gemm!('T', 'T', -one(T), x[col_range,:],
+                                 my_U_tiles[:,1:length(col_range),step], one(T),
+                                 U_rhs_update_buffer[:,row_range])
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        else
+            for step ∈ 1:length(my_U_tile_row_ranges)
+                row_range = my_U_tile_row_ranges[step]
+                col_range = my_U_tile_col_ranges[step]
+                if !isempty(row_range)
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    @views gemm!('T', 'T', -one(T), x[col_range,:],
+                                 my_U_tiles[:,1:length(col_range),step], one(T),
+                                 U_rhs_update_buffer[:,row_range])
+                end
+                # Get data required for the next tiles processed on the block.
+                if shared_comm_rank == 0
+                    # `diagonal_indices[step]` is non-zero if the root process is handling a
+                    # diagonal tile on this step.
+                    maybe_diagonal_tile = diagonal_indices[step]
+                    if maybe_diagonal_tile > 0
+                        # Data from the maybe_diagonal_tile is available, so start the
+                        # MPI.Ibcast!(). Also the maybe_diagonal_tile+1 row is guaranteed to be
+                        # completed, as only the root process will handle any tiles from that row
+                        # from this step on, so start the MPI.Ireduce!(). MPI non-blocking
+                        # collective operations have to be called in the same order on all ranks
+                        # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
+                        # have to match the order that these operations are started on the root
+                        # process.
+                        itile_rev = n_tiles - maybe_diagonal_tile + 1
+                        U_receive_requests[maybe_diagonal_tile] =
+                            temp_Ibcast!(@view(x[(itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m),:]),
+                                         distributed_comm; root=0)
+                        if maybe_diagonal_tile < n_tiles && distributed_comm_size > 1
+                            # We have sorted the tiles so that the shared_comm_rank=0 process
+                            # always handles the lowest row in the block, so if
+                            # `t` was handled on this step on this block, it was definitely
+                            # handled on this rank, so we do not need to synchronize.
+                            t = maybe_diagonal_tile + 1
+                            itile_rev = n_tiles - t + 1
+                            U_send_requests[t] =
+                                temp_Ireduce!(@view(U_rhs_update_buffer[:,(itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)]),
                                               +, distributed_comm; root=0)
                         end
                     end
