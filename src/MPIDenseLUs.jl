@@ -1,11 +1,13 @@
 module MPIDenseLUs
 
-export MPIDenseLU, mpi_dense_lu
+export MPIDenseLU, mpi_dense_lu, ldiv_no_distributed!
 
 using Combinatorics
 using LinearAlgebra
 using LinearAlgebra.BLAS: trsv!, trsm!, gemv!, gemm!
 using MPI
+using MPISharedMemLUs
+using MPISharedMemLUs: apply_row_swaps!
 using Primes
 using TimerOutputs
 

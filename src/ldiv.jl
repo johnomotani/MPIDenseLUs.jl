@@ -915,7 +915,7 @@ function U_solve!(x::AbstractVector, A_lu::MPIDenseLU{T}, y::AbstractVector) whe
                                           +, distributed_comm; root=0)
                     end
                 else
-                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # Need the [1:length(col_range)] selection, even though for most tiles
                     # this is just the full range, because the last row may have a different
                     # size
                     #@views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
@@ -978,6 +978,185 @@ function U_solve!(x::AbstractVector, A_lu::MPIDenseLU{T}, y::AbstractVector) whe
                         end
                         MPI.Wait(U_receive_requests[tile])
                     end
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        end
+    end
+
+    return nothing
+end
+
+"""
+    ldiv_no_distributed!(A_lu::MPIDenseLU{T}, b::AbstractMatrix{T},
+                         rhs_col_range=nothing) where T
+    ldiv_no_distributed!(x::AbstractMatrix{T}, A_lu::MPIDenseLU{T},
+                         b::AbstractMatrix{T}, rhs_col_range=nothing) where T
+
+Version of matrix-matrix `ldiv!()` that uses only shared-memory parallelism, not
+distributed memory. When not using distributed memory parallelism, no transposed buffer is
+needed, no buffer arrays are needed, and MPI communication operations are not needed, so
+there are some potential efficiencies from a shared-memory-only version.
+
+`rhs_col_range` can be passed to specify the columns of `b` that should have row swaps
+applied by this process.
+
+In the second version, `b` is copied into `x`.
+"""
+ldiv_no_distributed!
+
+function ldiv_no_distributed!(A_lu::MPIDenseLU{T}, b::AbstractMatrix{T},
+                              rhs_col_range=nothing) where T
+    @dlu_timeit A_lu.timer "ldiv_no_distributed!" begin
+        is_root = A_lu.is_root
+        row_permutation = A_lu.row_permutation
+        shared_comm_rank = A_lu.shared_comm_rank
+        shared_comm_size = A_lu.shared_comm_size
+        synchronize_shared = A_lu.synchronize_shared
+
+        if A_lu.distributed_comm_size > 1
+            error("ldiv_no_distributed!() does not support distributed MPI parallelism. "
+                  * "Got distributed_comm_size=$(A_lu.distributed_comm_size).")
+        end
+
+        # Parallelise some operations over columns where possible.
+        if rhs_col_range === nothing
+            ncol = size(b, 2)
+            cols_per_proc = (ncol + shared_comm_size - 1) ÷ shared_comm_size
+            rhs_col_range = shared_comm_rank*cols_per_proc+1:min((shared_comm_rank+1)*cols_per_proc,ncol)
+        end
+
+        # Permute the RHS matrix, using the row-swapping algorithm from MPISharedMemLUs.
+        apply_row_swaps!(@view(b[:,rhs_col_range]), A_lu.factorization_shared_lu.ipiv,
+                         length(rhs_col_range), A_lu.n)
+        synchronize_shared()
+
+        L_solve_no_distributed!(A_lu, b)
+        U_solve_no_distributed!(A_lu, b)
+    end
+
+    return b
+end
+function ldiv_no_distributed!(x::AbstractMatrix{T}, A_lu::MPIDenseLU{T},
+                              b::AbstractMatrix{T}, rhs_col_range=nothing) where T
+    @dlu_timeit A_lu.timer "ldiv_no_distributed!(x,A_lu,b)" begin
+        # Parallelise some operations over columns where possible.
+        if rhs_col_range === nothing
+            shared_comm_rank = A_lu.shared_comm_rank
+            shared_comm_size = A_lu.shared_comm_size
+            ncol = size(b, 2)
+            cols_per_proc = (ncol + shared_comm_size - 1) ÷ shared_comm_size
+            rhs_col_range = shared_comm_rank*cols_per_proc+1:min((shared_comm_rank+1)*cols_per_proc,ncol)
+        end
+        x[:,rhs_col_range] .= b[:,rhs_col_range]
+
+        return ldiv_no_distributed!(A_lu, x, rhs_col_range)
+    end
+end
+
+function L_solve_no_distributed!(A_lu::MPIDenseLU{T}, b::AbstractMatrix) where T
+    @dlu_timeit A_lu.timer "L_solve!" begin
+        my_L_tiles = A_lu.my_L_tiles
+        my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
+        my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
+        diagonal_indices = A_lu.diagonal_indices
+        synchronize_shared = A_lu.synchronize_shared
+        step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
+
+        if A_lu.is_root
+            for step ∈ 1:length(my_L_tile_row_ranges)
+                diagonal_tile = diagonal_indices[step]
+                row_range = my_L_tile_row_ranges[step]
+                col_range = my_L_tile_col_ranges[step]
+                if diagonal_tile > 0
+                    # Need the [1:length(row_range),1:length(col_range)] selection, even
+                    # though for most tiles this is just the full range, because the last row
+                    # and column may have a different size
+                    @views trsm!('L', 'L', 'N', 'U',
+                                 one(T),
+                                 my_L_tiles[1:length(row_range),1:length(col_range),step],
+                                 b[col_range,:])
+                else
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                                 b[col_range,:], one(T), b[row_range,:])
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        else
+            for step ∈ 1:length(my_L_tile_row_ranges)
+                row_range = my_L_tile_row_ranges[step]
+                col_range = my_L_tile_col_ranges[step]
+                if !isempty(row_range)
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                                 b[col_range,:], one(T), b[row_range,:])
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        end
+    end
+
+    return nothing
+end
+
+function U_solve_no_distributed!(A_lu::MPIDenseLU{T}, y::AbstractMatrix) where T
+    @dlu_timeit A_lu.timer "U_solve!" begin
+        my_U_tiles = A_lu.my_U_tiles
+        my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
+        my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
+        diagonal_indices = A_lu.diagonal_indices
+        synchronize_shared = A_lu.synchronize_shared
+        step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
+
+        if A_lu.is_root
+            for step ∈ 1:length(my_U_tile_row_ranges)
+                diagonal_tile = diagonal_indices[step]
+                row_range = my_U_tile_row_ranges[step]
+                col_range = my_U_tile_col_ranges[step]
+                if diagonal_tile > 0
+                    # Need the [1:length(row_range),1:length(col_range)] selection, even
+                    # though for most tiles this is just the full range, because the last row
+                    # and column may have a different size
+                    @views trsm!('L', 'U', 'N', 'N',
+                                 one(T),
+                                 my_U_tiles[1:length(row_range),1:length(col_range),step],
+                                 y[col_range,:])
+                else
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    @views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                                 y[col_range,:], one(T), y[row_range,:])
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        else
+            for step ∈ 1:length(my_U_tile_row_ranges)
+                row_range = my_U_tile_row_ranges[step]
+                col_range = my_U_tile_col_ranges[step]
+                if !isempty(row_range)
+                    # Need the [1:length(col_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    @views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                                 y[col_range,:], one(T), y[row_range,:])
                 end
                 if step_needs_synchronize_this_block[step] == 1
                     # Synchronize to avoid race conditions.
@@ -1259,7 +1438,7 @@ function U_solve!(x::AbstractMatrix, A_lu::MPIDenseLU{T}, y::AbstractMatrix,
                             temp_Ireduce!(this_buffer, +, distributed_comm; root=0)
                     end
                 else
-                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # Need the [1:length(col_range)] selection, even though for most tiles
                     # this is just the full range, because the last row may have a different
                     # size
                     @views gemm!('T', 'T', -one(T), x[col_range,:],
