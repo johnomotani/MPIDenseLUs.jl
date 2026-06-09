@@ -698,34 +698,56 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, comm::MPI.Comm,
 end
 
 function ldiv!(A_lu::MPIDenseLU{T}, b::AbstractVector{T}) where T
-    return ldiv!(b, A_lu, b)
+    if A_lu.distributed_comm_size == 1
+        buffer = A_lu.vec_buffer1
+        if A_lu.is_root
+            buffer .= b
+        end
+        return ldiv!(b, A_lu, buffer)
+    else
+        return ldiv!(b, A_lu, b)
+    end
 end
 
 function ldiv!(x::AbstractVector{T}, A_lu::MPIDenseLU{T}, b::Union{AbstractVector{T},Nothing}) where T
     @dlu_timeit A_lu.timer "ldiv!" begin
         is_root = A_lu.is_root
         row_permutation = A_lu.row_permutation
-        b_permuted = A_lu.vec_buffer1
-        y = A_lu.vec_buffer2
-        shared_comm_rank = A_lu.shared_comm_rank
         synchronize_shared = A_lu.synchronize_shared
+        distributed_comm_size = A_lu.distributed_comm_size
 
-        # Permute the RHS, storing in buffer2. This accounts for 'row permutations' that were
-        # generated/used for 'pivoting' when the L and U factors were computed.
-        if is_root
-            # Could parallelise this?
-            @views b_permuted .= b[row_permutation]
+        if distributed_comm_size == 1
+            # Permute the RHS. This accounts for 'row permutations' that were
+            # generated/used for 'pivoting' when the L and U factors were computed.
+            if is_root
+                # Could parallelise this?
+                @views x .= b[row_permutation]
+            end
+            synchronize_shared()
+
+            L_solve_no_distributed!(A_lu, x)
+            U_solve_no_distributed!(A_lu, x)
+        else
+            b_permuted = A_lu.vec_buffer1
+            y = A_lu.vec_buffer2
+
+            # Permute the RHS, storing in buffer2. This accounts for 'row permutations' that were
+            # generated/used for 'pivoting' when the L and U factors were computed.
+            if is_root
+                # Could parallelise this?
+                @views b_permuted .= b[row_permutation]
+            end
+
+            L_solve!(y, A_lu, b_permuted)
+            U_solve!(x, A_lu, y)
+
+            # Clean up MPI requests. These should all have been completed already, so this should
+            # not take any time.
+            MPI.Waitall(A_lu.L_send_requests)
+            MPI.Waitall(A_lu.U_send_requests)
+            MPI.Waitall(A_lu.L_receive_requests)
+            MPI.Waitall(A_lu.U_receive_requests)
         end
-
-        L_solve!(y, A_lu, b_permuted)
-        U_solve!(x, A_lu, y)
-
-        # Clean up MPI requests. These should all have been completed already, so this should
-        # not take any time.
-        MPI.Waitall(A_lu.L_send_requests)
-        MPI.Waitall(A_lu.U_send_requests)
-        MPI.Waitall(A_lu.L_receive_requests)
-        MPI.Waitall(A_lu.U_receive_requests)
     end
 
     return x
@@ -978,6 +1000,124 @@ function U_solve!(x::AbstractVector, A_lu::MPIDenseLU{T}, y::AbstractVector) whe
                         end
                         MPI.Wait(U_receive_requests[tile])
                     end
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        end
+    end
+
+    return nothing
+end
+
+function L_solve_no_distributed!(A_lu::MPIDenseLU{T}, b::AbstractVector) where T
+    @dlu_timeit A_lu.timer "L_solve!" begin
+        my_L_tiles = A_lu.my_L_tiles
+        my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
+        my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
+        diagonal_indices = A_lu.diagonal_indices
+        synchronize_shared = A_lu.synchronize_shared
+        step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
+
+        if A_lu.is_root
+            for step ∈ 1:length(my_L_tile_row_ranges)
+                diagonal_tile = diagonal_indices[step]
+                row_range = my_L_tile_row_ranges[step]
+                col_range = my_L_tile_col_ranges[step]
+                if diagonal_tile > 0
+                    # Need the [1:length(row_range),1:length(col_range)] selection, even
+                    # though for most tiles this is just the full range, because the last row
+                    # and column may have a different size
+                    @views trsv!('L', 'N', 'U',
+                                 my_L_tiles[1:length(row_range),1:length(col_range),step],
+                                 b[col_range])
+                else
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    #@views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                    #             b[col_range], one(T), b[row_range])
+                    @views gemv!('N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                                 b[col_range], one(T), b[row_range])
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        else
+            for step ∈ 1:length(my_L_tile_row_ranges)
+                row_range = my_L_tile_row_ranges[step]
+                col_range = my_L_tile_col_ranges[step]
+                if !isempty(row_range)
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    #@views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                    #             b[col_range], one(T), b[row_range])
+                    @views gemv!('N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                                 b[col_range], one(T), b[row_range])
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        end
+    end
+
+    return nothing
+end
+
+function U_solve_no_distributed!(A_lu::MPIDenseLU{T}, y::AbstractVector) where T
+    @dlu_timeit A_lu.timer "U_solve!" begin
+        my_U_tiles = A_lu.my_U_tiles
+        my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
+        my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
+        diagonal_indices = A_lu.diagonal_indices
+        synchronize_shared = A_lu.synchronize_shared
+        step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
+
+        if A_lu.is_root
+            for step ∈ 1:length(my_U_tile_row_ranges)
+                diagonal_tile = diagonal_indices[step]
+                row_range = my_U_tile_row_ranges[step]
+                col_range = my_U_tile_col_ranges[step]
+                if diagonal_tile > 0
+                    # Need the [1:length(row_range),1:length(col_range)] selection, even
+                    # though for most tiles this is just the full range, because the last row
+                    # and column may have a different size
+                    @views trsv!('U', 'N', 'N',
+                                 my_U_tiles[1:length(row_range),1:length(col_range),step],
+                                 y[col_range])
+                else
+                    # Need the [1:length(col_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    #@views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                    #             y[col_range], one(T), y[row_range])
+                    @views gemv!('N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                                 y[col_range], one(T), y[row_range])
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
+            end
+        else
+            for step ∈ 1:length(my_U_tile_row_ranges)
+                row_range = my_U_tile_row_ranges[step]
+                col_range = my_U_tile_col_ranges[step]
+                if !isempty(row_range)
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    #@views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                    #             y[col_range], one(T), y[row_range])
+                    @views gemv!('N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                                 y[col_range], one(T), y[row_range])
                 end
                 if step_needs_synchronize_this_block[step] == 1
                     # Synchronize to avoid race conditions.
