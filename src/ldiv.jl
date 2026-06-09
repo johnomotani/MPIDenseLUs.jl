@@ -1319,7 +1319,11 @@ All are shared-memory arrays if shared memory parallelism is being used.
 """
 function ldiv!(A_lu::MPIDenseLU{T}, b::AbstractMatrix{T}, buffer1::AbstractMatrix{T},
                buffer2::AbstractMatrix{T}, buffer3::AbstractMatrix{T}) where T
-    return ldiv!(b, A_lu, b, buffer1, buffer2)
+    if A_lu.distributed_comm_size == 1
+        return ldiv_no_distributed!(A_lu, b)
+    else
+        return ldiv!(b, A_lu, b, buffer1, buffer2)
+    end
 end
 
 """
@@ -1335,6 +1339,9 @@ necessary to leave `b` unmodified.
 function ldiv!(x::AbstractMatrix{T}, A_lu::MPIDenseLU{T}, b::AbstractMatrix{T},
                buffer1::AbstractMatrix{T}, buffer2::AbstractMatrix{T},
                buffer3::AbstractMatrix{T}) where T
+    if A_lu.distributed_comm_size == 1
+        return ldiv_no_distributed!(x, A_lu, b)
+    end
     @dlu_timeit A_lu.timer "ldiv!" begin
         is_root = A_lu.is_root
         row_permutation = A_lu.row_permutation
