@@ -65,7 +65,8 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
                   shared_comm_rank::Int64, shared_comm_size::Int64,
                   distributed_comm_rank::Int64, distributed_comm_size::Int64,
                   datatype::Type, allocate_shared_float::Ff, allocate_shared_int::Fi,
-                  synchronize_shared, group_K::Int64, group_L::Int64, timer) where {Ff,Fi}
+                  synchronize_shared, group_K::Int64, group_L::Int64, check_lu::Bool,
+                  timer) where {Ff,Fi}
 
     row_permutation = allocate_shared_int(m)
 
@@ -78,7 +79,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
         ipiv = allocate_shared_int(m)
         factorization_shared_lu = get_row_pivot_lu(ipiv, shared_comm;
                                                    synchronize=synchronize_shared,
-                                                   timer=timer)
+                                                   timer=timer, check=check_lu)
     end
 
     group_l, group_k = divrem(distributed_comm_rank, group_K) .+ 1

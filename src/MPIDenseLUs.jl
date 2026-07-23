@@ -211,7 +211,7 @@ function mpi_dense_lu(A::Union{AbstractMatrix,Nothing}, tile_size::Int64, comm::
             setup_lu(m, n, tile_size, shared_comm, shared_comm_rank, shared_comm_size,
                      distributed_comm_rank[], distributed_comm_size[], datatype,
                      allocate_shared_float, allocate_shared_int, synchronize_shared,
-                     group_K, group_L, timer)
+                     group_K, group_L, check_lu, timer)
 
         ldiv_variables =
             setup_ldiv(m, datatype, tile_size, comm, shared_comm, shared_comm_size,
